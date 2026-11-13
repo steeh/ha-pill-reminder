@@ -1,0 +1,215 @@
+blueprint:
+  name: Pill Reminder (morning & night)
+  description: >-
+    Sends a high-priority notification to an Android phone (Home Assistant
+    Companion app) at a morning and a night time you choose. The notification has
+    **Taken** and **Snooze** buttons. If it's ignored, it repeats until Taken is
+    tapped (or the "taken" toggle is switched on), up to a maximum number of times,
+    then sends a final "not taken" warning.
+
+
+    **Before you start, create these helpers** (Settings → Devices & services → Helpers):
+
+    - Two **Date and/or time** helpers set to *Time* only (e.g. "Morning Pill Time"
+      and "Night Pill Time"). Put them on your dashboard so you can change the times.
+
+    - One **Toggle** helper (e.g. "Pills taken").
+  domain: automation
+  source_url: https://github.com/steeh/ha-pill-reminder/blob/main/blueprints/automation/pill_reminder/pill_reminder.yaml
+  input:
+    notify_device:
+      name: Phone
+      description: The phone with the Home Assistant Companion app that gets the reminder.
+      selector:
+        device:
+          filter:
+            integration: mobile_app
+    morning_time:
+      name: Morning time helper
+      selector:
+        entity:
+          filter:
+            domain: input_datetime
+    night_time:
+      name: Night time helper
+      selector:
+        entity:
+          filter:
+            domain: input_datetime
+    taken_toggle:
+      name: '"Taken" toggle helper'
+      description: Switched off at each reminder time, switched on when Taken is tapped.
+      selector:
+        entity:
+          filter:
+            domain: input_boolean
+    morning_title:
+      name: Morning title
+      default: "💊 Morning pills"
+      selector:
+        text:
+    morning_message:
+      name: Morning message
+      default: Time to take your morning medication
+      selector:
+        text:
+    night_title:
+      name: Night title
+      default: "💊 Night pills"
+      selector:
+        text:
+    night_message:
+      name: Night message
+      default: Time to take your night medication
+      selector:
+        text:
+    repeat_minutes:
+      name: Repeat every (minutes)
+      description: How long to wait before reminding again. Also the Snooze length.
+      default: 15
+      selector:
+        number:
+          min: 1
+          max: 120
+          unit_of_measurement: min
+    max_reminders:
+      name: Maximum reminders
+      description: Stop after this many reminders and send a "not taken" warning.
+      default: 8
+      selector:
+        number:
+          min: 1
+          max: 50
+          mode: box
+    channel:
+      name: Android notification channel
+      description: >-
+        Created on the phone the first time. Long-press a reminder → settings to let
+        it override Do Not Disturb or pick a sound.
+      default: Pill Reminders
+      selector:
+        text:
+
+mode: restart
+
+variables:
+  notify_device: !input notify_device
+  taken_toggle: !input taken_toggle
+  morning_title: !input morning_title
+  morning_message: !input morning_message
+  night_title: !input night_title
+  night_message: !input night_message
+  repeat_minutes: !input repeat_minutes
+  max_reminders: !input max_reminders
+  channel: !input channel
+  notify_service: "notify.mobile_app_{{ device_attr(notify_device, 'name') | slugify }}"
+  tag: "pill_reminder_{{ this.entity_id | replace('automation.', '') }}"
+
+triggers:
+  - trigger: time
+    at: !input morning_time
+    id: am
+  - trigger: time
+    at: !input night_time
+    id: pm
+
+actions:
+  - variables:
+      dose: >-
+        {{ trigger.id if trigger is defined and trigger.id in ['am', 'pm']
+           else ('am' if now().hour < 14 else 'pm') }}
+      title: "{{ morning_title if dose == 'am' else night_title }}"
+      message: "{{ morning_message if dose == 'am' else night_message }}"
+      taken_action: "PILLS_TAKEN_{{ context.id }}"
+      snooze_action: "PILLS_SNOOZE_{{ context.id }}"
+
+  - action: input_boolean.turn_off
+    target:
+      entity_id: "{{ taken_toggle }}"
+
+  - repeat:
+      sequence:
+        - action: "{{ notify_service }}"
+          data:
+            title: "{{ title }}"
+            message: >-
+              {{ message if repeat.index == 1 else message ~ ' (reminder ' ~ repeat.index ~ ')' }}
+            data:
+              tag: "{{ tag }}"
+              priority: high
+              ttl: 0
+              importance: high
+              channel: "{{ channel }}"
+              sticky: "true"
+              vibrationPattern: "100, 400, 100, 400, 100, 400"
+              actions:
+                - action: "{{ taken_action }}"
+                  title: "✅ Taken"
+                - action: "{{ snooze_action }}"
+                  title: "⏰ Snooze {{ repeat_minutes | int }} min"
+
+        - wait_for_trigger:
+            - trigger: event
+              event_type: mobile_app_notification_action
+              event_data:
+                action: "{{ taken_action }}"
+              id: taken
+            - trigger: event
+              event_type: mobile_app_notification_action
+              event_data:
+                action: "{{ snooze_action }}"
+              id: snooze
+            - trigger: template
+              value_template: "{{ is_state(taken_toggle, 'on') }}"
+              id: taken
+          timeout:
+            minutes: "{{ repeat_minutes | int }}"
+          continue_on_timeout: true
+
+        - if:
+            - condition: template
+              value_template: "{{ wait.trigger is not none and wait.trigger.id == 'taken' }}"
+          then:
+            - action: input_boolean.turn_on
+              target:
+                entity_id: "{{ taken_toggle }}"
+
+        - if:
+            - condition: template
+              value_template: "{{ wait.trigger is not none and wait.trigger.id == 'snooze' }}"
+          then:
+            - action: "{{ notify_service }}"
+              data:
+                message: clear_notification
+                data:
+                  tag: "{{ tag }}"
+            - wait_template: "{{ is_state(taken_toggle, 'on') }}"
+              timeout:
+                minutes: "{{ repeat_minutes | int }}"
+              continue_on_timeout: true
+
+      until:
+        - condition: template
+          value_template: "{{ is_state(taken_toggle, 'on') or repeat.index >= max_reminders | int }}"
+
+  - if:
+      - condition: template
+        value_template: "{{ is_state(taken_toggle, 'off') }}"
+    then:
+      - action: "{{ notify_service }}"
+        data:
+          title: "⚠️ Pills not marked as taken"
+          message: "{{ message }} - no 'Taken' after {{ max_reminders | int }} reminders."
+          data:
+            tag: "{{ tag }}"
+            priority: high
+            ttl: 0
+            importance: high
+            channel: "{{ channel }}"
+            sticky: "true"
+    else:
+      - action: "{{ notify_service }}"
+        data:
+          message: clear_notification
+          data:
+            tag: "{{ tag }}"
